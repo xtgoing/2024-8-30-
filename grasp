@@ -1,0 +1,224 @@
+import argparse
+import json
+import logging
+import threading
+import pybullet as p
+import numpy as np
+import random
+
+import ray
+import torch
+import os
+import cv2
+from matplotlib import pyplot as plt
+import open3d as o3d
+import wandb
+import utils
+from constants import WORKSPACE_LIMITS
+from environment_sim import Environment
+from langsam import langsamutils
+from langsam.langsam_actor import LangSAM
+from logger import Logger
+from grasp_detetor import Graspnet
+import base64
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# 移除GPT相关代码
+# from openai import OpenAI
+# api_key = os.environ["OPENAI_API_KEY"]
+# client = OpenAI(api_key=api_key)
+
+def select_action(bboxes, pos_bboxes, text, actions, evaluate=True):
+    # 原逻辑：基于距离选择动作
+    # 改动：直接返回第一个动作（后续逻辑已重构）
+    return 0
+
+def load_image_as_base64(image_path):
+    with open(image_path, 'rb') as image_file:
+        base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+    return base64_image
+
+def print_grasping_result(result):
+    # 原逻辑：打印GPT生成的结果
+    # 改动：删除此函数（不再需要）
+    pass
+
+def create_cropping_box_from_boxes(boxes, image_size, margin=20):
+    # 原逻辑保持不变
+    if not boxes:
+        return 0, 0, image_size[0], image_size[1]
+    x1_min = max(0, min(b[0] for b in boxes) - margin)
+    y1_min = max(0, min(b[1] for b in boxes) - margin)
+    x2_max = min(image_size[0], max(b[2] for b in boxes) + margin)
+    y2_max = min(image_size[1], max(b[3] for b in boxes) + margin)
+    return int(x1_min), int(y1_min), int(x2_max), int(y2_max)
+
+def crop_pointcloud(pcd, cropping_box, color_image, depth_image, workspace_limits):
+    # 原逻辑保持不变
+    x1, y1, x2, y2 = cropping_box
+    depth_crop = depth_image[y1:y2, x1:x2]
+    color_crop = color_image[y1:y2, x1:x2]
+    mask = (depth_crop > 0)
+    points, colors = [], []
+    for i in range(depth_crop.shape[0]):
+        for j in range(depth_crop.shape[1]):
+            if mask[i, j]:
+                x, y = j + x1, i + y1
+                z = depth_crop[i, j]
+                points.append((x, y, z))
+                colors.append(color_crop[i, j] / 255.0)
+    points, colors = np.array(points), np.array(colors)
+    # 转换到工作空间坐标系（原逻辑保持不变）
+    return o3d.geometry.PointCloud()
+
+def visualize_cropping_box(image, cropping_box):
+    # 原逻辑保持不变
+    pass
+
+def visualize_pointcloud_with_grasps(pcd, grasp_poses):
+    # 原逻辑保持不变
+    pass
+
+def process_grasping_result(output):
+    # 原逻辑保持不变（已废弃）
+    return {}
+
+def select_fallback_object(objects):
+    # 按抓取评分排序（原逻辑保持不变）
+    sorted_objects = sorted(objects, key=lambda x: x['grasping_score'], reverse=True)
+    return sorted_objects[0] if sorted_objects else None
+
+def parse_args():
+    # 原逻辑保持不变
+    return argparse.Namespace()
+
+if __name__ == "__main__":
+    wandb.init(project="robotic-grasping1.0")
+    ray.init(num_gpus=1) 
+    use_gpu = torch.cuda.is_available()
+    gpu_allocation = 1 if use_gpu else 0
+    actor_options = {"num_gpus": gpu_allocation}
+    langsam_actor = LangSAM.options(**actor_options).remote(use_gpu=use_gpu)
+
+    args = parse_args()
+
+    # set device and seed
+    args.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    # parameters
+    num_episode = args.num_episode
+
+    # load environment
+    env = Environment(gui=True)
+    env.seed(args.seed)
+    logger = Logger(case_dir=args.testing_case_dir)
+    graspnet = Graspnet()
+
+    if os.path.exists(args.testing_case_dir):
+        filelist = os.listdir(args.testing_case_dir)
+        filelist.sort(key=lambda x:int(x[4:6]))
+    if args.testing_case != None:
+        filelist = [args.testing_case]
+    case = 0
+    iteration = 0
+    for f in filelist:
+        f = os.path.join(args.testing_case_dir, f)
+
+        logger.episode_reward_logs = []
+        logger.episode_step_logs = []
+        logger.episode_success_logs = []
+        for episode in range(num_episode):
+            episode_reward = 0
+            episode_steps = 0
+            done = False
+            reset = False
+
+            while not reset:
+                env.reset()
+                reset, lang_goal = env.add_object_push_from_file(f)
+                print(f"\033[032m Reset environment of episode {episode}, language goal {lang_goal}\033[0m")
+
+            while not done:
+                # 检查目标物体是否在场景中（原逻辑保持不变）
+                out_of_workspace = []
+                for obj_id in env.target_obj_ids:
+                    pos, _, _ = env.obj_info(obj_id)
+                    if pos[0] < WORKSPACE_LIMITS[0][0] or pos[0] > WORKSPACE_LIMITS[0][1] \
+                        or pos[1] < WORKSPACE_LIMITS[1][0] or pos[1] > WORKSPACE_LIMITS[1][1]:
+                        out_of_workspace.append(obj_id)
+                if len(out_of_workspace) == len(env.target_obj_ids):
+                    print("\033[031m Target objects are not in the scene!\033[0m")
+                    break
+
+                color_image, depth_image, mask_image = utils.get_true_heightmap(env)
+
+                # 移除GPT相关代码：不再发送请求到OpenAI
+                # 原逻辑：通过GPT生成裁剪框和目标选择
+                # 改动：直接使用GraspNet预测的抓取评分排序
+
+                # 获取裁剪后的点云
+                pcd = utils.get_fuse_pointcloud(env)
+                cropped_pcd = crop_pointcloud(pcd, (0, 0, color_image.shape[1], color_image.shape[0]), 
+                                            color_image, depth_image, WORKSPACE_LIMITS)
+                if cropped_pcd is None or len(np.asarray(cropped_pcd.points)) == 0:
+                    print("\033[031m Cropped point cloud is empty!\033[0m")
+                    continue
+
+                # 抓取检测（返回抓取位姿和评分）
+                with torch.no_grad():
+                    grasp_pose_set, grasp_scores, _ = graspnet.grasp_detection(cropped_pcd, env.get_true_object_poses())
+                
+                # 按抓取评分降序排序
+                sorted_indices = np.argsort(grasp_scores)[::-1]
+                sorted_grasp_poses = [grasp_pose_set[i] for i in sorted_indices]
+                sorted_scores = [grasp_scores[i] for i in sorted_indices]
+
+                # 依次尝试抓取
+                success = False
+                for idx, action in enumerate(sorted_grasp_poses):
+                    reward, done = env.step(action)
+                    episode_steps += 1
+                    episode_reward += reward
+                    print(f"\033[034m Episode: {episode}, step: {episode_steps}, reward: {round(reward, 2)}, "
+                          f"grasp score: {sorted_scores[idx]:.2f}\033[0m")
+                    wandb.log({"episode": episode, "step": episode_steps, "reward": reward, 
+                               "grasp_score": sorted_scores[idx]})
+
+                    if done:
+                        success = True
+                        break
+
+                if success:
+                    break
+
+            logger.episode_reward_logs.append(episode_reward)
+            logger.episode_step_logs.append(episode_steps)
+            logger.episode_success_logs.append(done)
+            logger.write_to_log('episode_reward', logger.episode_reward_logs)
+            logger.write_to_log('episode_step', logger.episode_step_logs)
+            logger.write_to_log('episode_success', logger.episode_success_logs)
+            print(f"\033[034m Episode: {episode}, steps: {episode_steps}, reward: {round(episode_reward, 2)}, "
+                  f"success: {done}\033[0m")
+
+            if episode == num_episode - 1:
+                avg_success = sum(logger.episode_success_logs)/len(logger.episode_success_logs)
+                avg_reward = sum(logger.episode_reward_logs)/len(logger.episode_reward_logs)
+                avg_step = sum(logger.episode_step_logs)/len(logger.episode_step_logs)
+                result_file = os.path.join(logger.result_directory, "case" + str(case) + ".txt")
+                with open(result_file, "w") as out_file:
+                    out_file.write(
+                        "%s %.18e %.18e %.18e\n"
+                        % (lang_goal, avg_success, avg_step, avg_reward)
+                    )
+                case += 1
+                print(f"\033[034m Language goal: {lang_goal}, avg steps: {avg_step:.2f}, avg reward: {avg_reward:.2f}, "
+                      f"avg success: {avg_success:.2f}\033[0m")
+                wandb.log({"lang_goal": lang_goal, "avg_success": avg_success, "avg_step": avg_step, 
+                           "avg_reward": avg_reward})
+
+    ray.shutdown()
